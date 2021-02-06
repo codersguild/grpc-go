@@ -11,6 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
+// Requires gRPC-Go v1.32.0 or later.
 const _ = grpc.SupportPackageIsVersion7
 
 // SearchServiceClient is the client API for SearchService service.
@@ -39,7 +40,7 @@ func (c *searchServiceClient) Search(ctx context.Context, in *SearchRequest, opt
 }
 
 func (c *searchServiceClient) StreamingSearch(ctx context.Context, opts ...grpc.CallOption) (SearchService_StreamingSearchClient, error) {
-	stream, err := c.cc.NewStream(ctx, &_SearchService_serviceDesc.Streams[0], "/grpc.testing.SearchService/StreamingSearch", opts...)
+	stream, err := c.cc.NewStream(ctx, &SearchService_ServiceDesc.Streams[0], "/grpc.testing.SearchService/StreamingSearch", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +99,7 @@ type UnsafeSearchServiceServer interface {
 }
 
 func RegisterSearchServiceServer(s grpc.ServiceRegistrar, srv SearchServiceServer) {
-	s.RegisterService(&_SearchService_serviceDesc, srv)
+	s.RegisterService(&SearchService_ServiceDesc, srv)
 }
 
 func _SearchService_Search_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -145,7 +146,10 @@ func (x *searchServiceStreamingSearchServer) Recv() (*SearchRequest, error) {
 	return m, nil
 }
 
-var _SearchService_serviceDesc = grpc.ServiceDesc{
+// SearchService_ServiceDesc is the grpc.ServiceDesc for SearchService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SearchService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "grpc.testing.SearchService",
 	HandlerType: (*SearchServiceServer)(nil),
 	Methods: []grpc.MethodDesc{

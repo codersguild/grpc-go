@@ -33,8 +33,10 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/google"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/credentials/tls/certprovider"
 	"google.golang.org/grpc/internal"
+	"google.golang.org/grpc/xds/internal/env"
 	"google.golang.org/grpc/xds/internal/version"
 )
 
@@ -161,9 +163,9 @@ var (
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "google_default" }
-				]
-			}],
-			"server_features" : ["foo", "bar"]
+				],
+				"server_features" : ["foo", "bar"]
+			}]
 		}`,
 		"serverSupportsV3": `
 		{
@@ -177,9 +179,9 @@ var (
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "google_default" }
-				]
-			}],
-			"server_features" : ["foo", "bar", "xds_v3"]
+				],
+				"server_features" : ["foo", "bar", "xds_v3"]
+			}]
 		}`,
 	}
 	metadata = &structpb.Struct{
@@ -206,7 +208,7 @@ var (
 	}
 	nilCredsConfigV2 = &Config{
 		BalancerName: "trafficdirector.googleapis.com:443",
-		Creds:        grpc.WithInsecure(),
+		Creds:        grpc.WithTransportCredentials(insecure.NewCredentials()),
 		NodeProto:    v2NodeProto,
 	}
 	nonNilCredsConfigV2 = &Config{
@@ -238,6 +240,9 @@ func (c *Config) compare(want *Config) error {
 	if diff := cmp.Diff(want.NodeProto, c.NodeProto, cmp.Comparer(proto.Equal)); diff != "" {
 		return fmt.Errorf("config.NodeProto diff (-want, +got):\n%s", diff)
 	}
+	if c.ServerResourceNameID != want.ServerResourceNameID {
+		return fmt.Errorf("config.ServerResourceNameID is %q, want %q", c.ServerResourceNameID, want.ServerResourceNameID)
+	}
 
 	// A vanilla cmp.Equal or cmp.Diff will not produce useful error message
 	// here. So, we iterate through the list of configs and compare them one at
@@ -250,31 +255,75 @@ func (c *Config) compare(want *Config) error {
 	for instance, gotCfg := range gotCfgs {
 		wantCfg, ok := wantCfgs[instance]
 		if !ok {
-			return fmt.Errorf("config.CertProviderConfigs has unexpected plugin instance %q with config %q", instance, string(gotCfg.Config.Canonical()))
+			return fmt.Errorf("config.CertProviderConfigs has unexpected plugin instance %q with config %q", instance, gotCfg.String())
 		}
-		if gotCfg.Name != wantCfg.Name || !cmp.Equal(gotCfg.Config.Canonical(), wantCfg.Config.Canonical()) {
-			return fmt.Errorf("config.CertProviderConfigs for plugin instance %q has config {%s, %s, want {%s, %s}", instance, gotCfg.Name, string(gotCfg.Config.Canonical()), wantCfg.Name, string(wantCfg.Config.Canonical()))
+		if got, want := gotCfg.String(), wantCfg.String(); got != want {
+			return fmt.Errorf("config.CertProviderConfigs for plugin instance %q has config %q, want %q", instance, got, want)
 		}
 	}
 	return nil
 }
 
+func fileReadFromFileMap(bootstrapFileMap map[string]string, name string) ([]byte, error) {
+	if b, ok := bootstrapFileMap[name]; ok {
+		return []byte(b), nil
+	}
+	return nil, os.ErrNotExist
+}
+
 func setupBootstrapOverride(bootstrapFileMap map[string]string) func() {
 	oldFileReadFunc := bootstrapFileReadFunc
-	bootstrapFileReadFunc = func(name string) ([]byte, error) {
-		if b, ok := bootstrapFileMap[name]; ok {
-			return []byte(b), nil
-		}
-		return nil, os.ErrNotExist
+	bootstrapFileReadFunc = func(filename string) ([]byte, error) {
+		return fileReadFromFileMap(bootstrapFileMap, filename)
 	}
-	return func() {
-		bootstrapFileReadFunc = oldFileReadFunc
-		os.Unsetenv(bootstrapFileEnv)
-	}
+	return func() { bootstrapFileReadFunc = oldFileReadFunc }
 }
 
 // TODO: enable leak check for this package when
 // https://github.com/googleapis/google-cloud-go/issues/2417 is fixed.
+
+// This function overrides the bootstrap file NAME env variable, to test the
+// code that reads file with the given fileName.
+func testNewConfigWithFileNameEnv(t *testing.T, fileName string, wantError bool, wantConfig *Config) {
+	origBootstrapFileName := env.BootstrapFileName
+	env.BootstrapFileName = fileName
+	defer func() { env.BootstrapFileName = origBootstrapFileName }()
+
+	c, err := NewConfig()
+	if (err != nil) != wantError {
+		t.Fatalf("NewConfig() returned error %v, wantError: %v", err, wantError)
+	}
+	if wantError {
+		return
+	}
+	if err := c.compare(wantConfig); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// This function overrides the bootstrap file CONTENT env variable, to test the
+// code that uses the content from env directly.
+func testNewConfigWithFileContentEnv(t *testing.T, fileName string, wantError bool, wantConfig *Config) {
+	b, err := bootstrapFileReadFunc(fileName)
+	if err != nil {
+		// If file reading failed, skip this test.
+		return
+	}
+	origBootstrapContent := env.BootstrapFileContent
+	env.BootstrapFileContent = string(b)
+	defer func() { env.BootstrapFileContent = origBootstrapContent }()
+
+	c, err := NewConfig()
+	if (err != nil) != wantError {
+		t.Fatalf("NewConfig() returned error %v, wantError: %v", err, wantError)
+	}
+	if wantError {
+		return
+	}
+	if err := c.compare(wantConfig); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // TestNewConfigV2ProtoFailure exercises the functionality in NewConfig with
 // different bootstrap file contents which are expected to fail.
@@ -336,12 +385,8 @@ func TestNewConfigV2ProtoFailure(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := os.Setenv(bootstrapFileEnv, test.name); err != nil {
-				t.Fatalf("os.Setenv(%s, %s) failed with error: %v", bootstrapFileEnv, test.name, err)
-			}
-			if _, err := NewConfig(); err == nil {
-				t.Fatalf("NewConfig() returned nil error, expected to fail")
-			}
+			testNewConfigWithFileNameEnv(t, test.name, true, nil)
+			testNewConfigWithFileContentEnv(t, test.name, true, nil)
 		})
 	}
 }
@@ -360,7 +405,7 @@ func TestNewConfigV2ProtoSuccess(t *testing.T) {
 		{
 			"emptyNodeProto", &Config{
 				BalancerName: "trafficdirector.googleapis.com:443",
-				Creds:        grpc.WithInsecure(),
+				Creds:        grpc.WithTransportCredentials(insecure.NewCredentials()),
 				NodeProto: &v2corepb.Node{
 					BuildVersion:         gRPCVersion,
 					UserAgentName:        gRPCUserAgentName,
@@ -379,67 +424,16 @@ func TestNewConfigV2ProtoSuccess(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := os.Setenv(bootstrapFileEnv, test.name); err != nil {
-				t.Fatalf("os.Setenv(%s, %s) failed with error: %v", bootstrapFileEnv, test.name, err)
-			}
-			c, err := NewConfig()
-			if err != nil {
-				t.Fatalf("NewConfig() failed: %v", err)
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
+			testNewConfigWithFileNameEnv(t, test.name, false, test.wantConfig)
+			testNewConfigWithFileContentEnv(t, test.name, false, test.wantConfig)
 		})
 	}
 }
 
-// TestNewConfigV3SupportNotEnabledOnClient verifies bootstrap functionality
-// when the GRPC_XDS_EXPERIMENTAL_V3_SUPPORT environment variable is not enabled
-// on the client. In this case, whether the server supports v3 or not, the
-// client will end up using v2.
-func TestNewConfigV3SupportNotEnabledOnClient(t *testing.T) {
-	if err := os.Setenv(v3SupportEnv, "false"); err != nil {
-		t.Fatalf("os.Setenv(%s, %s) failed with error: %v", v3SupportEnv, "true", err)
-	}
-	defer os.Unsetenv(v3SupportEnv)
-
-	cancel := setupBootstrapOverride(v3BootstrapFileMap)
-	defer cancel()
-
-	tests := []struct {
-		name       string
-		wantConfig *Config
-	}{
-		{"serverDoesNotSupportsV3", nonNilCredsConfigV2},
-		{"serverSupportsV3", nonNilCredsConfigV2},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if err := os.Setenv(bootstrapFileEnv, test.name); err != nil {
-				t.Fatalf("os.Setenv(%s, %s) failed with error: %v", bootstrapFileEnv, test.name, err)
-			}
-			c, err := NewConfig()
-			if err != nil {
-				t.Fatalf("NewConfig() failed: %v", err)
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-// TestNewConfigV3SupportEnabledOnClient verifies bootstrap functionality when
-// the GRPC_XDS_EXPERIMENTAL_V3_SUPPORT environment variable is enabled on the
-// client. Here the client ends up using v2 or v3 based on what the server
-// supports.
-func TestNewConfigV3SupportEnabledOnClient(t *testing.T) {
-	if err := os.Setenv(v3SupportEnv, "true"); err != nil {
-		t.Fatalf("os.Setenv(%s, %s) failed with error: %v", v3SupportEnv, "true", err)
-	}
-	defer os.Unsetenv(v3SupportEnv)
-
+// TestNewConfigV3Support verifies bootstrap functionality involving support for
+// the xDS v3 transport protocol. Here the client ends up using v2 or v3 based
+// on what the server supports.
+func TestNewConfigV3Support(t *testing.T) {
 	cancel := setupBootstrapOverride(v3BootstrapFileMap)
 	defer cancel()
 
@@ -453,26 +447,62 @@ func TestNewConfigV3SupportEnabledOnClient(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := os.Setenv(bootstrapFileEnv, test.name); err != nil {
-				t.Fatalf("os.Setenv(%s, %s) failed with error: %v", bootstrapFileEnv, test.name, err)
-			}
-			c, err := NewConfig()
-			if err != nil {
-				t.Fatalf("NewConfig() failed: %v", err)
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
+			testNewConfigWithFileNameEnv(t, test.name, false, test.wantConfig)
+			testNewConfigWithFileContentEnv(t, test.name, false, test.wantConfig)
 		})
 	}
 }
 
-// TestNewConfigBootstrapFileEnvNotSet tests the case where the bootstrap file
+// TestNewConfigBootstrapEnvPriority tests that the two env variables are read
+// in correct priority.
+//
+// the case where the bootstrap file
 // environment variable is not set.
-func TestNewConfigBootstrapFileEnvNotSet(t *testing.T) {
-	os.Unsetenv(bootstrapFileEnv)
+func TestNewConfigBootstrapEnvPriority(t *testing.T) {
+	oldFileReadFunc := bootstrapFileReadFunc
+	bootstrapFileReadFunc = func(filename string) ([]byte, error) {
+		return fileReadFromFileMap(v2BootstrapFileMap, filename)
+	}
+	defer func() { bootstrapFileReadFunc = oldFileReadFunc }()
+
+	goodFileName1 := "goodBootstrap"
+	goodConfig1 := nonNilCredsConfigV2
+
+	goodFileName2 := "serverSupportsV3"
+	goodFileContent2 := v3BootstrapFileMap[goodFileName2]
+	goodConfig2 := nonNilCredsConfigV3
+
+	origBootstrapFileName := env.BootstrapFileName
+	env.BootstrapFileName = ""
+	defer func() { env.BootstrapFileName = origBootstrapFileName }()
+
+	origBootstrapContent := env.BootstrapFileContent
+	env.BootstrapFileContent = ""
+	defer func() { env.BootstrapFileContent = origBootstrapContent }()
+
+	// When both env variables are empty, NewConfig should fail.
 	if _, err := NewConfig(); err == nil {
 		t.Errorf("NewConfig() returned nil error, expected to fail")
+	}
+
+	// When one of them is set, it should be used.
+	env.BootstrapFileName = goodFileName1
+	env.BootstrapFileContent = ""
+	if c, err := NewConfig(); err != nil || c.compare(goodConfig1) != nil {
+		t.Errorf("NewConfig() = %v, %v, want: %v, %v", c, err, goodConfig1, nil)
+	}
+
+	env.BootstrapFileName = ""
+	env.BootstrapFileContent = goodFileContent2
+	if c, err := NewConfig(); err != nil || c.compare(goodConfig2) != nil {
+		t.Errorf("NewConfig() = %v, %v, want: %v, %v", c, err, goodConfig1, nil)
+	}
+
+	// Set both, file name should be read.
+	env.BootstrapFileName = goodFileName1
+	env.BootstrapFileContent = goodFileContent2
+	if c, err := NewConfig(); err != nil || c.compare(goodConfig1) != nil {
+		t.Errorf("NewConfig() = %v, %v, want: %v, %v", c, err, goodConfig1, nil)
 	}
 }
 
@@ -486,13 +516,9 @@ const fakeCertProviderName = "fake-certificate-provider"
 // interprets the config provided to it as JSON with a single key and value.
 type fakeCertProviderBuilder struct{}
 
-func (b *fakeCertProviderBuilder) Build(certprovider.StableConfig, certprovider.Options) certprovider.Provider {
-	return &fakeCertProvider{}
-}
-
 // ParseConfig expects input in JSON format containing a map from string to
 // string, with a single entry and mapKey being "configKey".
-func (b *fakeCertProviderBuilder) ParseConfig(cfg interface{}) (certprovider.StableConfig, error) {
+func (b *fakeCertProviderBuilder) ParseConfig(cfg interface{}) (*certprovider.BuildableConfig, error) {
 	config, ok := cfg.(json.RawMessage)
 	if !ok {
 		return nil, fmt.Errorf("fakeCertProviderBuilder received config of type %T, want []byte", config)
@@ -504,7 +530,10 @@ func (b *fakeCertProviderBuilder) ParseConfig(cfg interface{}) (certprovider.Sta
 	if len(cfgData) != 1 || cfgData["configKey"] == "" {
 		return nil, errors.New("fakeCertProviderBuilder received invalid config")
 	}
-	return &fakeStableConfig{config: cfgData}, nil
+	fc := &fakeStableConfig{config: cfgData}
+	return certprovider.NewBuildableConfig(fakeCertProviderName, fc.canonical(), func(certprovider.BuildOptions) certprovider.Provider {
+		return &fakeCertProvider{}
+	}), nil
 }
 
 func (b *fakeCertProviderBuilder) Name() string {
@@ -515,7 +544,7 @@ type fakeStableConfig struct {
 	config map[string]string
 }
 
-func (c *fakeStableConfig) Canonical() []byte {
+func (c *fakeStableConfig) canonical() []byte {
 	var cfg string
 	for k, v := range c.config {
 		cfg = fmt.Sprintf("%s:%s", k, v)
@@ -542,9 +571,9 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "google_default" }
-				]
+				],
+				"server_features" : ["foo", "bar", "xds_v3"],
 			}],
-			"server_features" : ["foo", "bar", "xds_v3"],
 			"certificate_providers": "bad JSON"
 		}`,
 		"allUnknownCertProviders": `
@@ -559,9 +588,9 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "google_default" }
-				]
+				],
+				"server_features" : ["foo", "bar", "xds_v3"]
 			}],
-			"server_features" : ["foo", "bar", "xds_v3"],
 			"certificate_providers": {
 				"unknownProviderInstance1": {
 					"plugin_name": "foo",
@@ -585,9 +614,9 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "google_default" }
-				]
+				],
+				"server_features" : ["foo", "bar", "xds_v3"],
 			}],
-			"server_features" : ["foo", "bar", "xds_v3"],
 			"certificate_providers": {
 				"unknownProviderInstance": {
 					"plugin_name": "foo",
@@ -611,9 +640,9 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "google_default" }
-				]
+				],
+				"server_features" : ["foo", "bar", "xds_v3"]
 			}],
-			"server_features" : ["foo", "bar", "xds_v3"],
 			"certificate_providers": {
 				"unknownProviderInstance": {
 					"plugin_name": "foo",
@@ -637,11 +666,6 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 		t.Fatalf("config parsing for plugin %q failed: %v", fakeCertProviderName, err)
 	}
 
-	if err := os.Setenv(v3SupportEnv, "true"); err != nil {
-		t.Fatalf("os.Setenv(%s, %s) failed with error: %v", v3SupportEnv, "true", err)
-	}
-	defer os.Unsetenv(v3SupportEnv)
-
 	cancel := setupBootstrapOverride(bootstrapFileMap)
 	defer cancel()
 
@@ -650,11 +674,8 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 		Creds:        grpc.WithCredentialsBundle(google.NewComputeEngineCredentials()),
 		TransportAPI: version.TransportV3,
 		NodeProto:    v3NodeProto,
-		CertProviderConfigs: map[string]CertProviderConfig{
-			"fakeProviderInstance": {
-				Name:   fakeCertProviderName,
-				Config: wantCfg,
-			},
+		CertProviderConfigs: map[string]*certprovider.BuildableConfig{
+			"fakeProviderInstance": wantCfg,
 		},
 	}
 	tests := []struct {
@@ -684,19 +705,74 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := os.Setenv(bootstrapFileEnv, test.name); err != nil {
-				t.Fatalf("os.Setenv(%s, %s) failed with error: %v", bootstrapFileEnv, test.name, err)
-			}
-			c, err := NewConfig()
-			if (err != nil) != test.wantErr {
-				t.Fatalf("NewConfig() returned: (%+v, %v), wantErr: %v", c.CertProviderConfigs, err, test.wantErr)
-			}
-			if test.wantErr {
-				return
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
+			testNewConfigWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
+			testNewConfigWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
+		})
+	}
+}
+
+func TestNewConfigWithServerResourceNameID(t *testing.T) {
+	cancel := setupBootstrapOverride(map[string]string{
+		"badServerResourceNameID": `
+		{
+			"node": {
+				"id": "ENVOY_NODE_ID",
+				"metadata": {
+				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
+			    }
+			},
+			"xds_servers" : [{
+				"server_uri": "trafficdirector.googleapis.com:443",
+				"channel_creds": [
+					{ "type": "google_default" }
+				]
+			}],
+			"grpc_server_resource_name_id": 123456789
+		}`,
+		"goodServerResourceNameID": `
+		{
+			"node": {
+				"id": "ENVOY_NODE_ID",
+				"metadata": {
+				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
+			    }
+			},
+			"xds_servers" : [{
+				"server_uri": "trafficdirector.googleapis.com:443",
+				"channel_creds": [
+					{ "type": "google_default" }
+				]
+			}],
+			"grpc_server_resource_name_id": "grpc/server"
+		}`,
+	})
+	defer cancel()
+
+	tests := []struct {
+		name       string
+		wantConfig *Config
+		wantErr    bool
+	}{
+		{
+			name:    "badServerResourceNameID",
+			wantErr: true,
+		},
+		{
+			name: "goodServerResourceNameID",
+			wantConfig: &Config{
+				BalancerName:         "trafficdirector.googleapis.com:443",
+				Creds:                grpc.WithCredentialsBundle(google.NewComputeEngineCredentials()),
+				TransportAPI:         version.TransportV2,
+				NodeProto:            v2NodeProto,
+				ServerResourceNameID: "grpc/server",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testNewConfigWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
+			testNewConfigWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
 		})
 	}
 }
